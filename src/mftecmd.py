@@ -25,13 +25,32 @@ TASK_METADATA = {
     "description": "Runs Eric Zimmerman's MFTECmd  application on MFT files",
 }
 
+# Every name the extracted USN journal can arrive under. The extraction step
+# decides this, and it has produced at least four shapes:
+#   $UsnJrnl%3A$J   URL-escaped colon (the in-container VR path form)
+#   $UsnJrnl$J      colon stripped   <-- KAN-1109: what we ACTUALLY get
+#   $J              bare
+#   UsnJrnl-J       dash-separated
+#
+# This list is consumed TWICE -- once to admit the file at all
+# (COMPATIBLE_INPUTS) and once to decide whether to pass `-m $MFT` so MFTECmd
+# can resolve USN records to real paths. It used to be duplicated as two
+# literals, and they drifted: `$UsnJrnl$J` was in neither, so MFTECmd had
+# never run on the journal on any case. One constant, both uses.
+USN_JOURNAL_NAMES = [
+    "$UsnJrnl%3A$J",
+    "$UsnJrnl$J",
+    "$J",
+    "UsnJrnl-J",
+]
+
 COMPATIBLE_INPUTS = {
     "data_types": [],
     "mime_types": ["application/octet-stream", "text/plain"],
     "filenames": [
         "$Boot",
         "$I30","INDX",
-        "$UsnJrnl%3A$J","$J","UsnJrnl-J",
+        *USN_JOURNAL_NAMES,
         "$MFT",
         "$Secure_$SDS","$Secure%3A$SDS",
         "$LogFile",
@@ -124,7 +143,7 @@ def mftecmd(
         ]
 
         # add mft enrichment if this is a journal file and an mft file exists
-        if file.get('display_name') in ["$UsnJrnl%3A$J","$J","UsnJrnl-J"]:
+        if file.get('display_name') in USN_JOURNAL_NAMES:
             if (mft_item := next((f for f in input_files if f.get('display_name') == "$MFT"), None)):
                 command.append('-m')
                 command.append(mft_item.get("path"))
