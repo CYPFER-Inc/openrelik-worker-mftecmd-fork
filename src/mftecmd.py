@@ -15,6 +15,7 @@ import yaml
 from pathvalidate import sanitize_filename
 
 from .app import celery
+from .ts_datetime import add_datetime_column
 
 # Task name used to register and route the task to the correct queue.
 TASK_NAME = "openrelik-worker-mftecmd.tasks.mftecmd"
@@ -158,6 +159,21 @@ def mftecmd(
         # LogFile not supported by tool yet, but it tries to run against it and assumes it works
         # This leads it to try and collect a file that hasn't been made
         if os.path.exists(output_file.path):
+            # KAN-1160: MFTECmd names the $MFT timestamp columns Created0x10,
+            # LastModified0x10 etc -- none contains "time", so the TimeSketch
+            # import client rejects the whole file and the NTFS timeline is
+            # always empty, even though this task succeeded and the artefact is
+            # complete. Add a `datetime` column derived from Created before the
+            # CSV is handed on. Header-driven, so anything TimeSketch already
+            # accepts (notably $UsnJrnl$J, which has UpdateTimestamp) is left
+            # untouched.
+            try:
+                add_datetime_column(output_file.path, logger=logger)
+            except Exception as e:
+                # A failed rewrite must not lose the artefact: the original CSV
+                # is left intact and still emitted. It will fail the TimeSketch
+                # upload as before, which is visible, rather than vanishing.
+                logger.error(f"Could not add datetime column to MFTECmd CSV: {e}")
             output_files.append(output_file.to_dict())
 
     # Remove temp directory
