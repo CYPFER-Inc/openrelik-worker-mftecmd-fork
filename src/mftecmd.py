@@ -47,7 +47,17 @@ USN_JOURNAL_NAMES = [
 
 COMPATIBLE_INPUTS = {
     "data_types": [],
-    "mime_types": ["application/octet-stream", "text/plain"],
+    # KAN-1110: $MFT and $Boot are now content-signature typed by the server
+    # (create_file_in_db) with real mimes instead of the octet-stream fallback.
+    # Match those mimes so:
+    #   * a $MFT/$Boot whose filename was mangled still routes here (the typing
+    #     is a robust key the fragile filename list is not -- cf. KAN-1109), and
+    #   * the typing change cannot STRAND a renamed $MFT: once its mime is no
+    #     longer octet-stream, the old catch-all would have stopped matching it.
+    # The octet-stream / text-plain catch-all is dropped: every artefact MFTECmd
+    # parses is named in `filenames` below, so nothing is lost, and MFTECmd no
+    # longer has every unrelated octet-stream binary routed to it.
+    "mime_types": ["application/x-ntfs-mft", "application/x-ntfs-boot"],
     "filenames": [
         "$Boot",
         "$I30","INDX",
