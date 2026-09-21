@@ -15,6 +15,7 @@ import yaml
 from pathvalidate import sanitize_filename
 
 from .app import celery
+from .ts_datetime import add_datetime_column
 
 # Task name used to register and route the task to the correct queue.
 TASK_NAME = "openrelik-worker-mftecmd.tasks.mftecmd"
@@ -25,13 +26,42 @@ TASK_METADATA = {
     "description": "Runs Eric Zimmerman's MFTECmd  application on MFT files",
 }
 
+# Every name the extracted USN journal can arrive under. The extraction step
+# decides this, and it has produced at least four shapes:
+#   $UsnJrnl%3A$J   URL-escaped colon (the in-container VR path form)
+#   $UsnJrnl$J      colon stripped   <-- KAN-1109: what we ACTUALLY get
+#   $J              bare
+#   UsnJrnl-J       dash-separated
+#
+# This list is consumed TWICE -- once to admit the file at all
+# (COMPATIBLE_INPUTS) and once to decide whether to pass `-m $MFT` so MFTECmd
+# can resolve USN records to real paths. It used to be duplicated as two
+# literals, and they drifted: `$UsnJrnl$J` was in neither, so MFTECmd had
+# never run on the journal on any case. One constant, both uses.
+USN_JOURNAL_NAMES = [
+    "$UsnJrnl%3A$J",
+    "$UsnJrnl$J",
+    "$J",
+    "UsnJrnl-J",
+]
+
 COMPATIBLE_INPUTS = {
     "data_types": [],
-    "mime_types": ["application/octet-stream", "text/plain"],
+    # KAN-1110: $MFT and $Boot are now content-signature typed by the server
+    # (create_file_in_db) with real mimes instead of the octet-stream fallback.
+    # Match those mimes so:
+    #   * a $MFT/$Boot whose filename was mangled still routes here (the typing
+    #     is a robust key the fragile filename list is not -- cf. KAN-1109), and
+    #   * the typing change cannot STRAND a renamed $MFT: once its mime is no
+    #     longer octet-stream, the old catch-all would have stopped matching it.
+    # The octet-stream / text-plain catch-all is dropped: every artefact MFTECmd
+    # parses is named in `filenames` below, so nothing is lost, and MFTECmd no
+    # longer has every unrelated octet-stream binary routed to it.
+    "mime_types": ["application/x-ntfs-mft", "application/x-ntfs-boot"],
     "filenames": [
         "$Boot",
         "$I30","INDX",
-        "$UsnJrnl%3A$J","$J","UsnJrnl-J",
+        *USN_JOURNAL_NAMES,
         "$MFT",
         "$Secure_$SDS","$Secure%3A$SDS",
         "$LogFile",
@@ -124,7 +154,7 @@ def mftecmd(
         ]
 
         # add mft enrichment if this is a journal file and an mft file exists
-        if file.get('display_name') in ["$UsnJrnl%3A$J","$J","UsnJrnl-J"]:
+        if file.get('display_name') in USN_JOURNAL_NAMES:
             if (mft_item := next((f for f in input_files if f.get('display_name') == "$MFT"), None)):
                 command.append('-m')
                 command.append(mft_item.get("path"))
@@ -139,6 +169,21 @@ def mftecmd(
         # LogFile not supported by tool yet, but it tries to run against it and assumes it works
         # This leads it to try and collect a file that hasn't been made
         if os.path.exists(output_file.path):
+            # KAN-1160: MFTECmd names the $MFT timestamp columns Created0x10,
+            # LastModified0x10 etc -- none contains "time", so the TimeSketch
+            # import client rejects the whole file and the NTFS timeline is
+            # always empty, even though this task succeeded and the artefact is
+            # complete. Add a `datetime` column derived from Created before the
+            # CSV is handed on. Header-driven, so anything TimeSketch already
+            # accepts (notably $UsnJrnl$J, which has UpdateTimestamp) is left
+            # untouched.
+            try:
+                add_datetime_column(output_file.path, logger=logger)
+            except Exception as e:
+                # A failed rewrite must not lose the artefact: the original CSV
+                # is left intact and still emitted. It will fail the TimeSketch
+                # upload as before, which is visible, rather than vanishing.
+                logger.error(f"Could not add datetime column to MFTECmd CSV: {e}")
             output_files.append(output_file.to_dict())
 
     # Remove temp directory
