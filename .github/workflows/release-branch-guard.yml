@@ -1,0 +1,16 @@
+# release-branch-guard (KAN-1265): release/X.Y.x takes cherry-picks only.
+# Thin caller -- the check lives in CYPFER-Inc/cypfer-build-tools
+# (.github/workflows/release-branch-guard.yml, script in release_guard/).
+# This file must exist on the release branch too: for pull_request events
+# GitHub reads the workflow from the PR head, which is cut from release/X.Y.x.
+name: release-branch-guard
+
+on:
+  pull_request:
+    branches: ["release/**"]
+  push:
+    branches: ["release/**"]
+
+jobs:
+  release-branch-guard:
+    uses: CYPFER-Inc/cypfer-build-tools/.github/workflows/release-branch-guard.yml@dev
