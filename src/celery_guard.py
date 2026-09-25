@@ -69,7 +69,14 @@ it pairs with the mediator's ``orphaned_task``.
 import os
 
 import redis
-from celery import Task
+
+try:
+    from celery import Task
+except ImportError:
+    # Some workers' unit tests replace `celery` with a bare stub module before
+    # importing src.app. Nothing here runs for real in that case; see
+    # configure_delivery(), which is a no-op for a stubbed app.
+    Task = object
 
 VISIBILITY_TIMEOUT = int(os.getenv("OPENRELIK_BROKER_VISIBILITY_TIMEOUT_SEC", "43200"))
 # Total deliveries allowed: the first run plus (MAX_DELIVERIES - 1)
@@ -154,8 +161,10 @@ class GuardedTask(Task):
         if task_id and not request.called_directly:
             try:
                 self._guard_redis().delete(delivery_key(task_id, request.retries))
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # Harmless: the key expires on its own (DELIVERY_KEY_TTL).
+                _log(f"could not clear delivery count for {task_id}: "
+                     f"{type(exc).__name__}: {exc}")
         super().after_return(status, retval, task_id, args, kwargs, einfo)
 
 
@@ -165,9 +174,17 @@ def configure_delivery(app):
     ``app`` must have been built with ``task_cls=GuardedTask``, because the
     task base class is fixed when the app is constructed. This checks that
     rather than let a worker ship requeue-on-loss without the poison cap.
+
+    A real Celery app's ``Task`` is always a class. When it is not, the app is
+    a unit-test stand-in (MagicMock / SimpleNamespace for a stubbed ``celery``),
+    and there is nothing to configure. The QA regression
+    (test_kan1216_worker_delivery_semantics) asserts the real, running config.
     """
-    if not issubclass(app.Task, GuardedTask):
-        raise RuntimeError(
+    task_cls = getattr(app, "Task", None)
+    if not isinstance(task_cls, type):
+        return
+    if not issubclass(task_cls, GuardedTask):
+        raise TypeError(
             "KAN-1216: build the Celery app with task_cls=GuardedTask before "
             "calling configure_delivery(); acks_late without the poison cap "
             "can requeue an OOM task forever."

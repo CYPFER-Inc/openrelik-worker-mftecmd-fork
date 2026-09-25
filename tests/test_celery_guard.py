@@ -6,21 +6,21 @@ against an in-memory stand-in for Redis.
 """
 
 import sys
+import types
 from pathlib import Path
-from unittest.mock import Mock
 
 import pytest
 
-if isinstance(sys.modules.get("celery"), Mock):
-    # Some workers' conftest stubs celery with a MagicMock for the whole run;
-    # the guard needs the real trace path. This byte-identical file is
-    # exercised in every worker that loads real celery.
-    pytest.skip("celery is stubbed by this repo's conftest", allow_module_level=True)
+if "celery" in sys.modules and not getattr(sys.modules["celery"], "__file__", None):
+    # Some workers' tests replace celery with a MagicMock or a bare stub module
+    # for the whole run; the guard needs the real trace path. This
+    # byte-identical file is exercised in every worker that loads real celery.
+    pytest.skip("celery is stubbed by this repo's tests", allow_module_level=True)
 
-from celery import Celery  # noqa: E402
+from celery import Celery
 
-from src import celery_guard  # noqa: E402
-from src.celery_guard import (  # noqa: E402
+from src import celery_guard
+from src.celery_guard import (
     MAX_DELIVERIES,
     GuardedTask,
     PoisonTaskError,
@@ -136,8 +136,14 @@ def test_unacked_bookkeeping_is_private(app):
 
 def test_configure_delivery_refuses_app_without_guard():
     # acks_late without the poison cap is the requeue-forever failure mode.
-    with pytest.raises(RuntimeError, match="task_cls=GuardedTask"):
+    with pytest.raises(TypeError, match="task_cls=GuardedTask"):
         configure_delivery(Celery(broker="memory://"))
+
+
+def test_configure_delivery_ignores_a_stubbed_app():
+    # Workers whose unit tests stub celery build src.app against a stand-in;
+    # importing it must not blow up (a real app's Task is always a class).
+    configure_delivery(types.SimpleNamespace(task=lambda *a, **k: None))
 
 
 def test_worker_app_is_wired():
