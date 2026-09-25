@@ -45,6 +45,27 @@ USN_JOURNAL_NAMES = [
     "UsnJrnl-J",
 ]
 
+# KAN-1353: artefacts whose MFTECmd output has no timestamp at all -- $Boot is
+# boot-sector geometry, $Secure:$SDS is security-descriptor records. They are
+# still emitted (downloadable OR artefacts) but typed as reference data, so the
+# Timesketch upload this branch is chained to counts them as not-a-timeline
+# instead of a skipped file that makes every NTFS upload read as partial
+# coverage. The data_type keeps the `openrelik:mftecmd:` prefix the cleanup
+# classifier matches on.
+TIMELINE_DATA_TYPE = "openrelik:mftecmd:mftecmd"
+REFERENCE_DATA_TYPE = "openrelik:mftecmd:reference"
+NON_TIMELINE_NAMES = ["$Boot", "$Secure_$SDS", "$Secure%3A$SDS", "$Secure:$SDS"]
+NON_TIMELINE_MIME_TYPES = ["application/x-ntfs-boot"]
+
+
+def output_data_type(input_file):
+    """data_type for the MFTECmd CSV produced from `input_file`."""
+    if (input_file.get("display_name") in NON_TIMELINE_NAMES
+            or input_file.get("mime_type") in NON_TIMELINE_MIME_TYPES):
+        return REFERENCE_DATA_TYPE
+    return TIMELINE_DATA_TYPE
+
+
 COMPATIBLE_INPUTS = {
     "data_types": [],
     # KAN-1110: $MFT and $Boot are now content-signature typed by the server
@@ -139,7 +160,7 @@ def mftecmd(
         output_file = create_output_file(
             output_path,
             display_name=f"{prefix}{file.get('display_name')}_MFTECmd_output.csv",
-            data_type="openrelik:mftecmd:mftecmd",
+            data_type=output_data_type(file),
         )
 
         command = [
