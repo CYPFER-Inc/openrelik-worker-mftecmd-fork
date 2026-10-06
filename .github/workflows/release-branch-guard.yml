@@ -1,0 +1,209 @@
+# release-branch-guard (KAN-1265) -- refuse commits authored on release/X.Y.x.
+#
+# REUSABLE: every release-fleet repo calls this with a 5-line workflow
+# (see release_guard/caller.yml). The check itself is release_guard/
+# release-branch-guard.sh, embedded below verbatim -- a called workflow cannot
+# read this repo's files from the caller's checkout without a PAT, so the script
+# travels inside the YAML. tests/test_release_guard.py asserts the two copies are
+# identical; edit the .sh and paste, never edit only one.
+#
+# Referenced as `@dev` deliberately: dev is this repo's integration trunk and is
+# PR-gated by ci.yml (which runs the guard's own fixture tests), and a guard fix
+# must reach the whole fleet the moment it lands, not at the next main sync.
+# Callers need this repo's Actions access set to "organization" (private repo).
+#
+# Check-run name seen by branch protection: `release-branch-guard / guard`.
+name: release-branch-guard
+
+on:
+  workflow_call:
+    inputs:
+      integration-branch:
+        description: "dev | main | master | auto (first of dev/main/master that exists)"
+        type: string
+        default: auto
+      allow-globs:
+        description: "Extra whitespace-separated path/basename globs allowed to exist only on the release branch"
+        type: string
+        default: ""
+  # This repo guards its own release branches with the same job.
+  pull_request:
+    branches: ["release/**"]
+  push:
+    branches: ["release/**"]
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch integration and release refs
+        run: git fetch --no-tags --quiet origin '+refs/heads/*:refs/remotes/origin/*'
+      - name: Release-branch guard
+        env:
+          GUARD_BASE: ${{ github.base_ref || github.ref_name }}
+          GUARD_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          GUARD_BEFORE: ${{ github.event_name == 'push' && github.event.before || '' }}
+          GUARD_INTEGRATION: ${{ inputs.integration-branch || 'auto' }}
+          GUARD_ALLOW: ${{ inputs.allow-globs }}
+        run: |
+          # --- guard script begin (release_guard/release-branch-guard.sh) ---
+          #!/usr/bin/env bash
+          # release-branch-guard -- refuse commits AUTHORED on a release/X.Y.x branch (KAN-1265).
+          #
+          # The 1.1.x line stranded 58 commits written directly on release/1.1.x during rc
+          # cycles that never came home to dev, so a later cut could silently revert dev
+          # work. The rule is: every non-merge commit on a release branch must be a
+          # cherry-pick of a commit on the integration branch. This script is the CI half
+          # of that rule; `python -m release_ops drift` is the reporting half. Both use the
+          # same three legit-commit signals, in this order:
+          #
+          #   1. the commit is already reachable from origin/<integration>   (FF / merge-forward)
+          #   2. a `cherry picked from commit <sha>` trailer names a commit on integration (`-x` pick)
+          #   3. the commit's patch-id matches a commit on integration          (pick made without `-x`)
+          #
+          # plus an allowlist for files that legitimately exist only on the release branch
+          # (the frozen settings profile, `settings_refinery-vX.Y.Z.env`). Merge commits are
+          # skipped: a FF/base merge or a `-m1` pick-merge is never authored content.
+          #
+          # Inputs (environment):
+          #   GUARD_BASE         release branch name, e.g. release/1.2.x           (required)
+          #   GUARD_HEAD         commit to check up to                            (default HEAD)
+          #   GUARD_BEFORE       push event: previous tip of the release branch   (optional;
+          #                      all-zeros / unreachable => fall back to origin/<base>..HEAD)
+          #   GUARD_INTEGRATION  dev | main | master | auto                        (default auto)
+          #   GUARD_ALLOW        extra allow globs, whitespace-separated           (optional)
+          #
+          # Refs origin/<integration> and origin/<base> must already be fetched (the
+          # workflow does `fetch-depth: 0` + a full refs/heads fetch).
+          #
+          # Exit 0 = clean, 1 = reverse drift found, 2 = usage / missing refs.
+          set -euo pipefail
+
+          base=${GUARD_BASE:-}
+          head=${GUARD_HEAD:-HEAD}
+          before=${GUARD_BEFORE:-}
+          integ=${GUARD_INTEGRATION:-auto}
+          extra_allow=${GUARD_ALLOW:-}
+
+          if [ -z "$base" ]; then
+            echo "release-branch-guard: GUARD_BASE is required (release/X.Y.x)" >&2
+            exit 2
+          fi
+          case "$base" in
+            release/*) ;;
+            *) echo "release-branch-guard: '$base' is not a release/* branch -- nothing to guard"; exit 0 ;;
+          esac
+
+          if [ "$integ" = auto ]; then
+            integ=""
+            for b in dev main master; do
+              if git rev-parse -q --verify "origin/$b^{commit}" >/dev/null; then integ=$b; break; fi
+            done
+            if [ -z "$integ" ]; then
+              echo "release-branch-guard: no origin/dev, origin/main or origin/master ref -- cannot decide what 'picked from dev' means" >&2
+              exit 2
+            fi
+          fi
+          if ! git rev-parse -q --verify "origin/$integ^{commit}" >/dev/null; then
+            echo "release-branch-guard: origin/$integ not fetched" >&2
+            exit 2
+          fi
+
+          # Default allowlist: the frozen per-release settings profile (openrelik-pipeline)
+          # and its rc predecessors. Matched against the full path AND the basename.
+          allow="settings_refinery-*.env settings_v*.env settings_*-rc*.env $extra_allow"
+
+          # Range start: a push gives us the previous tip; a PR (or a first push / force
+          # push whose `before` is unreachable) compares against the release branch itself.
+          zeros=0000000000000000000000000000000000000000
+          start=""
+          if [ -n "$before" ] && [ "$before" != "$zeros" ] && git cat-file -e "$before^{commit}" 2>/dev/null; then
+            start=$before
+          elif git rev-parse -q --verify "origin/$base^{commit}" >/dev/null; then
+            start="origin/$base"
+          else
+            # Branch being created and no previous tip: measure from where it left integration.
+            start=$(git merge-base "origin/$integ" "$head")
+          fi
+
+          # Commits under review. Merges are skipped by design (see header).
+          mapfile -t commits < <(git rev-list --no-merges --reverse "$start..$head")
+          if [ "${#commits[@]}" -eq 0 ]; then
+            echo "release-branch-guard: no non-merge commits in $start..$head -- clean"
+            exit 0
+          fi
+
+          # Patch-id equivalence: `git cherry <upstream> <head> <limit>` marks each commit
+          # in <limit>..<head> with `-` when an equivalent patch is on <upstream>.
+          declare -A patch_on_integ=()
+          while IFS= read -r line; do
+            case "$line" in
+              "- "*) patch_on_integ["${line#- }"]=1 ;;
+            esac
+          done < <(git cherry "origin/$integ" "$head" "$start" 2>/dev/null || true)
+
+          on_integration() { git merge-base --is-ancestor "$1" "origin/$integ" 2>/dev/null; }
+
+          trailer_ok() { # $1 = sha ; true when a -x trailer names a commit on integration
+            local body src full
+            body=$(git log -1 --format=%B "$1")
+            while IFS= read -r src; do
+              [ -n "$src" ] || continue
+              full=$(git rev-parse -q --verify "$src^{commit}" 2>/dev/null || true)
+              if [ -n "$full" ] && on_integration "$full"; then return 0; fi
+            done < <(printf '%s\n' "$body" | grep -oiE 'cherry picked from commit [0-9a-f]{7,40}' | awk '{print $NF}')
+            return 1
+          }
+
+          allowed_paths_only() { # $1 = sha ; true when EVERY changed path matches an allow glob
+            local f g ok any=0
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              any=1; ok=0
+              for g in $allow; do
+                # shellcheck disable=SC2254
+                case "$f" in $g) ok=1; break ;; esac
+                case "${f##*/}" in $g) ok=1; break ;; esac
+              done
+              [ "$ok" = 1 ] || return 1
+            done < <(git diff-tree --no-commit-id --name-only -r "$1")
+            [ "$any" = 1 ]
+          }
+
+          drift=()
+          for c in "${commits[@]}"; do
+            short=$(git log -1 --format='%h %s' "$c" | cut -c1-90)
+            if on_integration "$c"; then
+              echo "  ok   on-$integ            $short"
+            elif trailer_ok "$c"; then
+              echo "  ok   -x-trailer           $short"
+            elif [ -n "${patch_on_integ[$c]:-}" ]; then
+              echo "  ok   patch-on-$integ      $short"
+            elif allowed_paths_only "$c"; then
+              echo "  ok   allowlisted-paths    $short"
+            else
+              echo "  DRIFT authored-on-release $short"
+              drift+=("$c")
+            fi
+          done
+
+          if [ "${#drift[@]}" -gt 0 ]; then
+            cat >&2 <<EOF
+
+          release-branch-guard: ${#drift[@]} commit(s) in $start..$head were AUTHORED on $base
+          (not picked from origin/$integ). Release branches take cherry-picks only:
+
+            1. land the change on $integ via a normal feature PR
+            2. git cherry-pick -x <sha>   (the -x trailer is what this guard reads)
+            3. open the pick PR against $base
+
+          If this is the frozen settings profile, it is allowlisted by name
+          (settings_refinery-*.env); anything else must go through $integ first.
+          EOF
+            exit 1
+          fi
+          echo "release-branch-guard: clean -- every commit in $start..$head traces to origin/$integ"
+          # --- guard script end ---
