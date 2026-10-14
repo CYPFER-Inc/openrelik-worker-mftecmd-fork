@@ -9,6 +9,10 @@ package-mode = false
 [tool.poetry.dependencies]
 python = ">=3.11,<4.0"
 celery = { extras = ["redis"], version = "^5.4.0" }
+# KAN-1422: PyJWT is transitive (redis>=5.1 requires it, via celery[redis] /
+# openrelik-worker-common). Floor it past the 2.13.x/2.14.0 advisories.
+# Supply-chain hygiene: nothing in this worker verifies JWTs.
+pyjwt = ">=2.15.0"
 openrelik-common = "^0.7.0"
 openrelik-worker-common = "^0.11.0"
 PyYAML ="^6.0.3"
